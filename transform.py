@@ -627,12 +627,12 @@ if __name__ == "__main__":
     ]
 
     name_mask = (
-        (df[LATIN_NAME_COLS[0]].notna()) &
-        (df[LATIN_NAME_COLS[1]].notna()) &
-        (df[LATIN_NAME_COLS[2]].notna()) &
-        (df[LATIN_NAME_COLS[3]].notna()) &
-        (df[LATIN_NAME_COLS[4]].notna()) &
-        (df[LATIN_NAME_COLS[5]].notna()) &
+        (df[LATIN_NAME_COLS[0]].notna()) |
+        (df[LATIN_NAME_COLS[1]].notna()) |
+        (df[LATIN_NAME_COLS[2]].notna()) |
+        (df[LATIN_NAME_COLS[3]].notna()) |
+        (df[LATIN_NAME_COLS[4]].notna()) |
+        (df[LATIN_NAME_COLS[5]].notna()) |
         (df[NONLATIN_NAME_COL].notna())
     )
     subject_names = df.loc[name_mask, COLUMNS_SUBJECT_NAMES]
