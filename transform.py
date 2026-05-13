@@ -4,6 +4,7 @@ import pandas as pd
 import pycountry
 import re
 import unicodedata
+from functools import lru_cache
 from typing import SupportsInt, Iterable
 
 
@@ -46,6 +47,7 @@ def restructure_raw(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows[1:], columns=rows[0])
 
 
+@lru_cache
 def normalise_label(s: str) -> str:
     """Normalise column names (some names call for further tidying)."""
     s = s.strip().lower()
@@ -58,7 +60,10 @@ def normalise_label(s: str) -> str:
     return s.strip("_")
 
 
-def normalise_categorical_data(df: pd.DataFrame, data: dict[str, Iterable[str]]) -> pd.DataFrame:
+def normalise_categorical_data(
+    df: pd.DataFrame,
+    data: dict[str, Iterable[str]]
+) -> pd.DataFrame:
     """Normalise data whose meaning is not altered via normalisation.
     `data` has items like column_name: expected_values."""
     df = df.copy()
@@ -73,7 +78,12 @@ def normalise_categorical_data(df: pd.DataFrame, data: dict[str, Iterable[str]])
     # check for unexpected values
     for col, expected in data.items():
         # drop NaNs and select values who aren't expected
-        unexpected = df[col].dropna()[~df[col].dropna().isin(expected)].unique()
+        unexpected = (
+            df[col]
+            .dropna()
+            [~df[col].dropna().isin(expected)]
+            .unique()
+        )
         
         if len(unexpected) > 0:
             print(f"[WARNING] Unexpected values in {col}: {unexpected}")
@@ -91,21 +101,27 @@ def build_full_name(row) -> str:
     return " ".join(row.dropna().astype(str)).strip()
 
 
+@lru_cache
 def remove_accents(name: str) -> str:
     """Used to normalise names."""
-    return "".join([c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c)])
+    if not unicodedata.combining(c):
+        return np.nan
+    return "".join([c for c in unicodedata.normalize("NFKD", name)])
 
 
+@lru_cache
 def replace_punctuation_with_whitespace(name: str) -> str:
     """Used to normalise names."""
     return re.sub(r"[^\w\s]", " ", name)
 
 
+@lru_cache
 def normalise_whitespace(s: str) -> str:
     """Used to normalise names."""
     return re.sub(r"\s+", " ", s)
 
 
+@lru_cache
 def normalise_name(name: str) -> str:
     """Normalise names for matching purposes, provided exclusively
     in addition to their raw counterparts."""
@@ -121,11 +137,13 @@ def normalise_name(name: str) -> str:
     return text.strip()
 
 
+@lru_cache
 def remove_whitespace(name: str) -> str:
     """Used to construct compact names, another type of name normalisation."""
     return re.sub(r"\s+", "", name)
 
 
+@lru_cache
 def compact_name(name: str) -> str:
     """Like normalised names, compact names are used for matching purposes,
     provided exclusively in addition to their raw counterparts."""
@@ -134,10 +152,73 @@ def compact_name(name: str) -> str:
     return remove_whitespace(name)
 
 
+def remove_least_complete_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce name dataframe by selecting
+    most complete name where applicable."""
+
+    df = df.copy()
+
+    # add precision_score to help with D.O.B selection
+    df["precision_score"] = (
+        df[LATIN_NAME_COLS]
+        .notna()
+        .sum(axis=1)
+    )
+
+    # sort so most complete names come first
+    df = (
+        df.sort_values(
+            ["unique_id", "precision_score"],
+            ascending=[True, False]
+        )
+    )
+
+    rows_to_keep = []
+
+    for uid, group in df.groupby(["unique_id", "full_name"]):
+
+        kept = []
+
+        for idx, row in group.iterrows():
+
+            is_redundant = False
+
+            for kept_row in kept:
+
+                compatible = True
+
+                for col in LATIN_NAME_COLS:
+
+                    current = row[col]
+                    existing = kept_row[col]
+
+                    if pd.notna(current) and pd.notna(existing):
+                        if current != existing:
+                            compatible = False
+                            break
+                
+                if compatible:
+                    is_redundant = True
+                    break
+            
+            if not is_redundant:
+                kept.append(row)
+                rows_to_keep.append(idx)
+
+    df = (
+        df.loc[rows_to_keep]
+        .drop(columns=["precision_score"])
+        .sort_index()
+    )
+
+    return df
+
+
 # ===========================================================================
 # DATE PROCESSING
 # ===========================================================================
 
+@lru_cache
 def valid_year(year: SupportsInt) -> bool:
     # fine to hard-code 2026 iff this script is only utilised
     # for the specific dataset in question
@@ -145,10 +226,12 @@ def valid_year(year: SupportsInt) -> bool:
     return int(year) <= 2026
 
 
+@lru_cache
 def valid_month(month: SupportsInt) -> bool:
     return 1<= int(month) <= 12
 
 
+@lru_cache
 def valid_day(day: SupportsInt, month: SupportsInt, year: SupportsInt) -> bool:
     try:
         max_day = calendar.monthrange(int(year), int(month))[1]
@@ -157,6 +240,7 @@ def valid_day(day: SupportsInt, month: SupportsInt, year: SupportsInt) -> bool:
         return False
 
 
+@lru_cache
 def parse_dob(raw_dob):
     """Used to parse D.O.Bs with inconsistent format, missing
     values, or have placeholder values. Extracts year, month,
@@ -266,10 +350,73 @@ def parse_dob(raw_dob):
     return result
 
 
+def remove_least_complete_dobs(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce D.O.B dataframe by selecting
+    most complete D.O.B where applicable."""
+
+    df = df.copy()
+
+    # add precision_score to help with D.O.B selection
+    df["precision_score"] = (
+        df[["year", "month", "day"]]
+        .notna()
+        .sum(axis=1)
+    )
+
+    # sort so most complete D.O.Bs come first
+    df = (
+        df.sort_values(
+            ["unique_id", "precision_score"],
+            ascending=[True, False]
+        )
+    )
+
+    rows_to_keep = []
+
+    for uid, group in df.groupby("unique_id"):
+        
+        kept = []
+
+        for idx, row in group.iterrows():
+
+            is_redundant = False
+
+            for kept_row in kept:
+
+                compatible = True
+
+                for col in ["year", "month", "day"]:
+
+                    current = row[col]
+                    existing = kept_row[col]
+
+                    if pd.notna(current) and pd.notna(existing):
+                        if current != existing:
+                            compatible = False
+                            break
+                
+                if compatible:
+                    is_redundant = True
+                    break
+            
+            if not is_redundant:
+                kept.append(row)
+                rows_to_keep.append(idx)
+
+    df = (
+        df.loc[rows_to_keep]
+        .drop(columns=["precision_score"])
+        .sort_index()
+    )
+
+    return df
+
+
 # ===========================================================================
 # COUNTRY PROCESSING
 # ===========================================================================
 
+@lru_cache
 def normalise_country(country: str) -> str:
     """Normalise countries for matching purposes, provided exclusively
     in addition to their raw counterparts."""
@@ -281,6 +428,7 @@ def normalise_country(country: str) -> str:
     return country.strip()
 
 
+@lru_cache
 def strip_leading_articles(name):
     """Used to match normalised countries to their ISO codes."""
     if pd.isnull(name):
@@ -288,6 +436,7 @@ def strip_leading_articles(name):
     return re.sub(r"^THE\s+", "", name)
 
 
+@lru_cache
 def extract_modern_country(text):
     """Used to extract present-day countries from historical countries,
     to match countries to their ISO codes."""
@@ -387,6 +536,7 @@ ISO_OVERRIDES = {
 }
 
 
+@lru_cache
 def resolve_country(raw_value):
     """Used to parse countries with inconsistent labels. Normalises and
     strips leading articles from countries, then attempts to match the
@@ -456,8 +606,6 @@ if __name__ == "__main__":
     # LOAD RAW DATA
     # =======================================================================
 
-    print("[INFO] Loading data")
-
     # load raw data as pandas dataframe
     df_raw = pd.read_csv('UK-Sanctions-List.csv', engine="python", dtype=str)
 
@@ -469,8 +617,6 @@ if __name__ == "__main__":
     # =======================================================================
     # Normalise column names right after loading such that the column names
     # are consistent throughout the script.
-
-    print("[INFO] Renaming columns")
 
     # normalise column names
     df.columns = [normalise_label(c) for c in df.columns]
@@ -490,8 +636,6 @@ if __name__ == "__main__":
     # =======================================================================
     # CLEANING
     # =======================================================================
-
-    print("[INFO] Cleaning data")
 
     # general cleaning pass removing leading/trailing whitespace
     df = df.apply(lambda c: c.str.strip() if c.dtype == "object" else c)
@@ -522,8 +666,6 @@ if __name__ == "__main__":
     # STRUCTURAL NORMALISATION OF NAMES
     # =======================================================================
 
-    print("[INFO] Normalising name structure (subject_type-dependent)")
-
     # define some useful masks
     INDIVIDUAL_MASK = df["subject_type"] == "individual"
     ENTITY_MASK = df["subject_type"] == "entity"
@@ -541,16 +683,19 @@ if __name__ == "__main__":
         if len(anomalies) == 0:
             continue
 
+        cols_to_print = ["unique_id", "subject_type", name_col, "name_6"]
         print(
             f"\n[WARNING] Detected rows with unexpected data in {name_col}:"
-            f"{anomalies[["unique_id", "subject_type", name_col, "name_6"]].head()}"
+            f"\n{anomalies[cols_to_print].head()}"
         )
         
         # migrate the anomalous name data to the (assumedly) correct column
         # in the new rows
         anomalies["name_6"] = anomalies[name_col]
         # remove anomalous data from the rows that already exist in `df`
-        df.loc[anomalous_mask, name_col] = [np.nan for _ in range(len(anomalies))]
+        df.loc[anomalous_mask, name_col] = [
+            np.nan for _ in range(len(anomalies))
+        ]
         # add to list for later concatenation with `df`    
         anomalous_rows.append(anomalies.drop_duplicates())
 
@@ -560,36 +705,19 @@ if __name__ == "__main__":
             df = pd.concat([df, anomalies], axis=0, ignore_index=True)
 
     # =======================================================================
-    # QUICK DATA VARIABILITY INSPECTION
-    # =======================================================================
-
-    print(
-        "[INFO] Checking on variation of data under each column "
-        "for each subject_type"
-    )
-
-    for c in df.columns:
-        dtype = str(df[c].dtype)
-        if dtype != "object" and c != "subject_type":
-            print(f"[INFO] Unique {c} values by subject_type:")
-            print(df[["subject_type", c]].groupby("subject_type").nunique())
-
-    # =======================================================================
     # CONSTRUCTION
     # =======================================================================
-
-    print("[INFO] Constructing resulting dataset")
 
     # add row_id
     get_id = lambda x, L: f"{x:0>{len(str(L - 1))}}" 
     df["id"] = [get_id(i, len(df)) for i in range(len(df))]
 
     # build tables:
-    # - subjects
-    # - subject_names
-    # - subject_dobs
-    # - subject_countries
-    # - subject_identifiers
+    # - SUBJECTS
+    # - SUBJECT_NAMES
+    # - SUBJECT_DOBS
+    # - SUBJECT_COUNTRIES
+    # - SUBJECT_IDENTIFIERS
 
     # -----------------------------------------------------------------------
     # SUBJECTS
@@ -610,6 +738,10 @@ if __name__ == "__main__":
     # SUBJECT_NAMES
     # -----------------------------------------------------------------------
 
+    print("-" * 80)
+    print("SUBJECT_NAMES")
+    print("-" * 80)
+
     COLUMNS_SUBJECT_NAMES = [
         "id",
         "unique_id",
@@ -620,48 +752,127 @@ if __name__ == "__main__":
         "name_4",
         "name_5",
         "name_6",
-        "name_nonlatin_script",
-        "nonlatin_script_type",
-        "nonlatin_script_language",
         "alias_strength",
     ]
 
+    # select rows with name data
     name_mask = (
         (df[LATIN_NAME_COLS[0]].notna()) |
         (df[LATIN_NAME_COLS[1]].notna()) |
         (df[LATIN_NAME_COLS[2]].notna()) |
         (df[LATIN_NAME_COLS[3]].notna()) |
         (df[LATIN_NAME_COLS[4]].notna()) |
-        (df[LATIN_NAME_COLS[5]].notna()) |
-        (df[NONLATIN_NAME_COL].notna())
+        (df[LATIN_NAME_COLS[5]].notna())
     )
     subject_names = df.loc[name_mask, COLUMNS_SUBJECT_NAMES]
+
+    print(
+        f"[INFO] Initial SUBJECT_NAMES:"
+        f"\n{subject_names.columns.tolist()}"
+        f"\nrows: {len(subject_names):,}"
+        f"\ncols: {len(subject_names.columns):,}"
+    )
+
+    # rename name_type values (drop excessive use of "name")
     subject_names["name_type"] = (
         subject_names["name_type"]
         .replace({
             "primary_name": "primary",
-            "primary_name_variation": "variation",
+            "primary_name_variation": "primary_variation",
         })
     )
+
     # build full_name column
     subject_names[FULL_NAME_COL] = (
         subject_names[LATIN_NAME_COLS]
         .apply(build_full_name, axis=1)
-        .apply(normalise_name)
         .replace("", np.nan)
     )
-    # build compact_name
-    subject_names["compact_name"] = (
-        subject_names[FULL_NAME_COL]
-        .apply(compact_name)
-        .replace("", np.nan)
+
+    # drop exact duplicate names
+    n_names_pre_dedup = len(subject_names)
+
+    subject_names = (
+        subject_names
+        .drop_duplicates(["unique_id", "name_type", *LATIN_NAME_COLS])
     )
-    # build has_nonlatin_name flag
-    subject_names["has_nonlatin_name"] = subject_names[NONLATIN_NAME_COL].notna()
+    
+    n_names_dedup = len(subject_names)
+    
+    if n_names_pre_dedup > n_names_dedup:
+        print(
+            f"[INFO] Removed {n_names_pre_dedup - n_names_dedup:,} "
+            f"rows with duplicate names "
+            f"-> {n_names_dedup:,} rows"
+        )
+
+    # remove least complete names
+    subject_names = remove_least_complete_names(subject_names)
+
+    n_names_most_complete = len(subject_names)
+    
+    if n_names_dedup > n_names_most_complete:
+        print(
+            f"[INFO] Removed {n_names_dedup - n_names_most_complete:,} "
+            f"rows with redundant names "
+            f"-> {n_names_most_complete:,} rows"
+        )
+
+    # add name_id
+    subject_names["name_id"] = [
+        get_id(i, len(subject_names))
+        for i in range(len(subject_names))
+    ]
+
+    # sort by unique_id, name_type
+    subject_names["priority"] = (
+        subject_names["name_type"]
+        .replace({"primary": 3, "primary_variation": 2, "alias": 1})
+    )
+    
+    subject_names = (
+        subject_names
+        .sort_values(by=["unique_id", "priority"], ascending=[True, False])
+        .drop(columns=["priority"])
+    )
+
+    # reorder columns
+    subject_names_cols = [
+        "name_id",
+        "unique_id",
+        "name_type",
+        "alias_strength",
+        "full_name",
+        "name_6",
+        "name_1",
+        "name_2",
+        "name_3",
+        "name_4",
+        "name_5",
+    ]
+
+    subject_names = subject_names[subject_names_cols]
+
+    print(
+        f"[INFO] Final SUBJECT_NAMES:"
+        f"\n{subject_names.columns.tolist()}"
+        f"\nrows: {len(subject_names):,}"
+        f"\ncols: {len(subject_names.columns):,}"
+    )
+
+    # NOTE: duplicate and redundant names have been removed
+    #       within each unique_id, but this could be further
+    #       reduced to fully unique names
+    #       -> name-to-unique_id could be many-to-one
+    #       -> would require mapping name to unique_id list
 
     # -----------------------------------------------------------------------
     # SUBJECT_DOBS
     # -----------------------------------------------------------------------
+
+    print("-" * 80)
+    print("SUBJECT_DOBS")
+    print("-" * 80)
 
     COLUMNS_SUBJECT_DOBS = [
         "id",
@@ -670,38 +881,184 @@ if __name__ == "__main__":
     ]
 
     subject_dobs = df.loc[df["dob"].notna(), COLUMNS_SUBJECT_DOBS]
+
+    print(
+        f"[INFO] Initial SUBJECT_DOBS:"
+        f"\n{subject_dobs.columns.tolist()}"
+        f"\nrows: {len(subject_dobs):,}"
+        f"\ncols: {len(subject_dobs.columns):,}"
+    )
+
     subject_dobs_parsed = subject_dobs["dob"].apply(parse_dob)
     subject_dobs_parsed_df = pd.DataFrame(subject_dobs_parsed.tolist())
-    subject_dobs = pd.concat([subject_dobs, subject_dobs_parsed_df.drop("raw_dob", axis=1)], axis=1)
+    subject_dobs = pd.concat(
+        [
+            subject_dobs,
+            subject_dobs_parsed_df.drop(columns=["raw_dob"])
+        ],
+        axis=1
+    )
 
-    subject_dobs.columns = ["id", "unique_id", "raw_value", "year", "month", "day", "precision", "is_valid", "parse_issues"]
+    # rename columns (remove excessive use of "dob")
+    subject_dobs.columns = [
+        # canonical columns (`COLUMNS_SUBJECT_DOBS`)
+        "id",
+        "unique_id",
+        "raw_value",
+        # extra columns added from D.O.B parsing
+        "year",
+        "month",
+        "day",
+        "precision",
+        "is_valid",
+        "parse_issues",
+    ]
+
+    # check all D.O.Bs included are valid
+    n_invalid = len(subject_dobs) - subject_dobs["is_valid"].sum()
+    if n_invalid > 0:
+        print(f"[WARNING] {n_invalid:,} invalid D.O.Bs detected")
+
+        # remove rows with invalid D.O.Bs
+        dob_mask = subject_dobs["is_valid"] == True
+        subject_dobs = subject_dobs[dob_mask]
+
+        print(f"[INFO] Removed {len(dob_mask) - len(subject_dobs):,} invalid D.O.Bs")
+
+    print(f"[INFO] All {len(subject_dobs):,} D.O.B rows have valid D.O.Bs")
+
+    # join lists of strings in parse_issues
+    subject_dobs["parse_issues"] = (
+        subject_dobs["parse_issues"]
+        .apply(", ".join)
+        .replace("", np.nan)
+    )
+
+    # drop is_valid column (all D.O.Bs are now valid)
+    subject_dobs = subject_dobs.drop(columns=["is_valid"])
+
+    # drop exact duplicate D.O.Bs
+    n_dobs_pre_dedup = len(subject_dobs)
+    
+    subject_dobs = (
+        subject_dobs
+        .drop_duplicates(subset=["unique_id", "year", "month", "day"])
+    )
+
+    n_dobs_dedup = len(subject_dobs)
+    
+    if n_dobs_pre_dedup > n_dobs_dedup:
+        print(
+            f"[INFO] Removed {n_dobs_pre_dedup - n_dobs_dedup:,} "
+            f"rows with duplicate D.O.Bs "
+            f"-> {n_dobs_dedup:,} rows"
+        )
+
+    # remove least complete D.O.Bs
+    subject_dobs = remove_least_complete_dobs(subject_dobs)
+    
+    n_dobs_most_complete = len(subject_dobs)
+    
+    if n_dobs_dedup > n_dobs_most_complete:
+        print(
+            f"[INFO] Removed {n_dobs_dedup - n_dobs_most_complete:,} "
+            f"rows with redundant D.O.Bs "
+            f"-> {n_dobs_most_complete:,} rows"
+        )
+
+    # add dob_id
+    subject_dobs["dob_id"] = [
+        get_id(i, len(subject_dobs))
+        for i in range(len(subject_dobs))
+    ]
+
+    # sort by unique_id, precision
+    subject_dobs["priority"] = (
+        subject_dobs[["year", "month", "day"]]
+        .notna()
+        .sum(axis=1)
+    )
+
+    subject_dobs = (
+        subject_dobs
+        .sort_values(by=["unique_id", "priority"], ascending=[True, False])
+        .drop(columns=["priority"])
+    )
+
+    # reorder columns
+    subject_dobs_cols = [
+        "dob_id",
+        "unique_id",
+        "year",
+        "month",
+        "day",
+        "precision",
+        "parse_issues",
+    ]
+
+    subject_dobs = subject_dobs[subject_dobs_cols]
+
+    print(
+        f"[INFO] Final SUBJECT_DOBS:"
+        f"\n{subject_dobs.columns.tolist()}"
+        f"\nrows: {len(subject_dobs):,}"
+        f"\ncols: {len(subject_dobs.columns):,}"
+    )
+
+    # NOTE: duplicate and redundant D.O.Bs have been removed
+    #       within each unique_id, but this could be further
+    #       reduced to fully unique D.O.Bs
+    #       -> D.O.B-to-unique_id could be many-to-one
+    #       -> would require mapping D.O.B to unique_id list
 
     # -----------------------------------------------------------------------
     # SUBJECT_COUNTRIES
     # -----------------------------------------------------------------------
 
+    print("-" * 80)
+    print("SUBJECT_COUNTRIES")
+    print("-" * 80)
+
+    # columns for dataframe initialisation
     COLUMNS_SUBJECT_COUNTRIES = [
         "id",
         "unique_id",
     ]
 
-    subject_countries_types = []
+    # construction list
+    subject_countries_types: list[pd.DataFrame] = []
 
-    for c in ["country_of_birth", "address_country", "nationality"]:
+    # different types of identifiers to add to the dataframe
+    subject_country_types = [
+        "country_of_birth",
+        "address_country",
+        "nationality"
+    ]
 
-        type_mask = df[c].notna()
+    # populate construction list
+    for c in subject_country_types:
+
+        type_mask = df[c].notna()  # select rows with identifier data
         cols = [*COLUMNS_SUBJECT_COUNTRIES, c]
-
+        # filter for desired rows and columns
         subject_countries_type = df.loc[type_mask, cols]
-
+        # rename `c` to raw_value and migrate `c` to country_type
         subject_countries_type.columns = [*COLUMNS_SUBJECT_COUNTRIES, "raw_value"]
-        
         subject_countries_type["country_type"] = c
-        
+        # add dataframe to construction list
         subject_countries_types.append(subject_countries_type)
     
+    # construct dataframe
     subject_countries = pd.concat(subject_countries_types, axis=0)
 
+    print(
+        f"[INFO] Initial SUBJECT_COUNTRIES:"
+        f"\n{subject_countries.columns.tolist()}"
+        f"\nrows: {len(subject_countries):,}"
+        f"\ncols: {len(subject_countries.columns):,}"
+    )
+
+    # rename country_type values
     subject_countries["country_type"] = (
         subject_countries["country_type"]
         .replace({
@@ -710,42 +1067,62 @@ if __name__ == "__main__":
         })
     )
 
-    subject_countries["parsed"] = subject_countries["raw_value"].apply(resolve_country)
-    
-    subject_countries["normalised_value"] = (
-        subject_countries["parsed"]
-        .apply(lambda x: x["normalised_country"])
+    # parse countries
+    subject_countries["parsed"] = (
+        subject_countries["raw_value"]
+        .apply(resolve_country)
     )
 
+    # add iso codes
     subject_countries["iso"] = (
         subject_countries["parsed"]
         .apply(lambda x: x["iso_code"] if x["iso_available"] else np.nan)
     )
-    
+
+    # add method for country resolution
     subject_countries["resolution_method"] = (
         subject_countries["parsed"]
         .apply(lambda x: x["resolution_method"])
     )
-    
+
+    # add iso_available flag
     subject_countries["iso_available"] = (
         subject_countries["parsed"]
         .apply(lambda x: x["iso_available"])
     )
-    
-    subject_countries = subject_countries.drop("parsed", axis=1)
+
+    # drop parsed column (desired data already extracted)
+    subject_countries = (
+        subject_countries
+        .drop(columns=["parsed"])
+    )
+
+    print(
+        f"[INFO] Final SUBJECT_COUNTRIES:"
+        f"\n{subject_countries.columns.tolist()}"
+        f"\nrows: {len(subject_countries):,}"
+        f"\ncols: {len(subject_countries.columns):,}"
+    )
 
     # -----------------------------------------------------------------------
     # SUBJECT_IDENTIFIERS
     # -----------------------------------------------------------------------
 
+    print("-" * 80)
+    print("SUBJECT_IDENTIFIERS")
+    print("-" * 80)
+
+    # columns for dataframe initialisation
     COLUMNS_SUBJECT_IDENTIFIERS = [
         "id",
         "unique_id",
         "ofsi_group_id",
     ]
 
-    subject_identifier_types = []
+    # construction list
+    subject_identifier_types: list[pd.DataFrame] = []
 
+    # different types of identifiers to add to the dataframe
     id_cols = [
         "national_identifier_number",
         "passport_number",
@@ -754,30 +1131,33 @@ if __name__ == "__main__":
         "hull_identification_number_hin"
     ]
 
+    # populate construction list
     for c in id_cols:
 
-        type_mask = df[c].notna()
+        type_mask = df[c].notna()  # select rows with identifier data
         cols = [*COLUMNS_SUBJECT_IDENTIFIERS, c]
-
+        # filter for desired rows and columns
         subject_identifier_type = df.loc[type_mask, cols]
-
+        # rename `c` to raw_value and migrate `c` to identifier_type
         subject_identifier_type.columns = [*COLUMNS_SUBJECT_IDENTIFIERS, "raw_value"]
-
         subject_identifier_type["identifier_type"] = c
-
+        # add dataframe to construction list
         subject_identifier_types.append(subject_identifier_type)
     
+    # construct dataframe
     subject_identifiers = pd.concat(subject_identifier_types, axis=0)
 
+    # rename identifier_type values
     subject_identifiers["identifier_type"] = (
         subject_identifiers["identifier_type"].replace({
             "national_identifier_number": "national",
             "passport_number": "passport",
             "imo_number": "imo",
-            "hull_identification_number_hin": "hull"
+            "hull_identification_number_hin": "hin"
         })
     )
 
+    # get additional_info for passport data
     passport_mask = subject_identifiers["identifier_type"] == "passport"
     subject_identifiers.loc[passport_mask, "additional_info"] = (
         df.loc[
@@ -785,7 +1165,8 @@ if __name__ == "__main__":
             "passport_additional_information"
         ]
     )
-    
+
+    # get additional_info for national id data
     nationalid_mask = subject_identifiers["identifier_type"] == "national"
     subject_identifiers.loc[nationalid_mask, "additional_info"] = (
         df.loc[
@@ -794,11 +1175,20 @@ if __name__ == "__main__":
         ]
     )
 
+    print(
+        f"[INFO] SUBJECT_IDENTIFIERS:"
+        f"\n{subject_identifiers.columns.tolist()}"
+        f"\nrows: {len(subject_identifiers):,}"
+        f"\ncols: {len(subject_identifiers.columns):,}"
+    )
+
     # =======================================================================
     # EXPORT
     # =======================================================================
 
-    print("[INFO] Exporting transformed dataset")
+    print("-" * 80)
+    print("EXPORT")
+    print("-" * 80)
 
     OUTPUT_PATH = "uk_sanctions_transformed.xlsx"
 
@@ -823,11 +1213,3 @@ if __name__ == "__main__":
     for filename, table in CSV_FILES.items():
         table.to_csv(filename, index=False)
         print(f"[INFO] CSV written to {filename}")
-
-    # -----------------------------------------------------------------------
-    # Quality report
-    # -----------------------------------------------------------------------
-
-    # print("\n", "-" * 80, "\n", "QUALITY REPORT", "\n", "-" * 80)
-    # for key, value in quality_report.items():
-    #     print(f"  {key}: {value}")
